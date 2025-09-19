@@ -1,0 +1,1082 @@
+<?php
+session_start();
+require_once '../../config/database.php';
+
+if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'user') {
+    header('Location: ../../index.php');
+    exit();
+}
+
+$registration_id = $_GET['id'] ?? 0;
+
+if (!$registration_id) {
+    header('Location: perlombaan.php');
+    exit();
+}
+
+// Get registration details with all related data
+$stmt = $pdo->prepare("
+    SELECT 
+        r.*,
+        c.nama_perlombaan,
+        c.tanggal_pelaksanaan,
+        c.whatsapp_group,
+        a.nama as athlete_name,
+        a.user_id as athlete_user_id,
+        k.nama_kontingen,
+        cc.nama_kategori as competition_category_name,
+        ct.nama_kompetisi,
+        ct.biaya_pendaftaran,
+        ac.nama_kategori as age_category_name
+    FROM registrations r
+    JOIN competitions c ON r.competition_id = c.id
+    JOIN athletes a ON r.athlete_id = a.id
+    JOIN kontingen k ON a.kontingen_id = k.id
+    LEFT JOIN competition_types ct ON r.competition_type_id = ct.id
+    LEFT JOIN age_categories ac ON r.age_category_id = ac.id
+    LEFT JOIN competition_categories cc ON r.category_id = cc.id
+    WHERE r.id = ?
+");
+$stmt->execute([$registration_id]);
+$registration = $stmt->fetch();
+
+if (!$registration) {
+    sendNotification('Pendaftaran tidak ditemukan.', 'error');
+    header('Location: perlombaan.php');
+    exit();
+}
+
+// Verify user owns this registration
+if ($registration['athlete_user_id'] != $_SESSION['user_id']) {
+    sendNotification('Anda tidak memiliki akses untuk mengedit pendaftaran ini.', 'error');
+    header('Location: perlombaan.php');
+    exit();
+}
+
+// Check if registration can be edited (only pending payments can be edited)
+if (!in_array($registration['payment_status'], ['pending', 'unpaid'])) {
+    sendNotification('Pendaftaran yang sudah dibayar tidak dapat diedit.', 'error');
+    header('Location: perlombaan.php');
+    exit();
+}
+
+$competition_id = $registration['competition_id'];
+
+// Get user's athletes
+$stmt = $pdo->prepare("
+    SELECT a.*, k.nama_kontingen 
+    FROM athletes a 
+    JOIN kontingen k ON a.kontingen_id = k.id 
+    WHERE a.user_id = ? 
+    ORDER BY a.nama
+");
+$stmt->execute([$_SESSION['user_id']]);
+$athletes = $stmt->fetchAll();
+
+// Get age categories
+$stmt = $pdo->prepare("SELECT * FROM age_categories WHERE competition_id = ? ORDER BY nama_kategori");
+$stmt->execute([$competition_id]);
+$age_categories = $stmt->fetchAll();
+
+// Get competition types with tanding flag
+$stmt = $pdo->prepare("SELECT * FROM competition_types WHERE competition_id = ? ORDER BY nama_kompetisi");
+$stmt->execute([$competition_id]);
+$competition_types = $stmt->fetchAll();
+
+// Add is_tanding flag
+foreach ($competition_types as &$type) {
+    $type['is_tanding'] = (stripos($type['nama_kompetisi'], 'tanding') !== false) ? 1 : 0;
+}
+
+// Handle form submission
+if ($_POST && isset($_POST['action']) && $_POST['action'] === 'update') {
+    $athlete_id = $_POST['athlete_id'] ?? 0;
+    $age_category_id = $_POST['age_category_id'] ?? 0;
+    $category_id = $_POST['category_id'] ?? null;
+    $competition_type_id = $_POST['competition_type_id'] ?? 0;
+    
+    try {
+        // Validate athlete belongs to user
+        $stmt = $pdo->prepare("SELECT a.*, k.id as kontingen_id FROM athletes a JOIN kontingen k ON a.kontingen_id = k.id WHERE a.id = ? AND a.user_id = ?");
+        $stmt->execute([$athlete_id, $_SESSION['user_id']]);
+        $athlete = $stmt->fetch();
+        
+        if (!$athlete) {
+            throw new Exception('Atlet tidak ditemukan atau bukan milik Anda.');
+        }
+        
+        // Check if athlete already registered for this competition (excluding current registration)
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM registrations WHERE competition_id = ? AND athlete_id = ? AND id != ?");
+        $stmt->execute([$competition_id, $athlete_id, $registration_id]);
+        if ($stmt->fetchColumn() > 0) {
+            throw new Exception('Atlet sudah terdaftar dalam perlombaan ini.');
+        }
+        
+        // Get competition type to check if it's tanding
+        $stmt = $pdo->prepare("SELECT * FROM competition_types WHERE id = ? AND competition_id = ?");
+        $stmt->execute([$competition_type_id, $competition_id]);
+        $competition_type = $stmt->fetch();
+        
+        if (!$competition_type) {
+            throw new Exception('Jenis kompetisi tidak valid.');
+        }
+        
+        $is_tanding = (stripos($competition_type['nama_kompetisi'], 'tanding') !== false);
+        
+        // Validate age category only for tanding competitions
+        if ($is_tanding && $age_category_id) {
+            $stmt = $pdo->prepare("SELECT * FROM age_categories WHERE id = ? AND competition_id = ?");
+            $stmt->execute([$age_category_id, $competition_id]);
+            $age_category = $stmt->fetch();
+            
+            if (!$age_category) {
+                throw new Exception('Kategori umur tidak valid.');
+            }
+            
+            // Check athlete age
+            $athlete_age = date_diff(date_create($athlete['tanggal_lahir']), date_create('today'))->y;
+            if ($athlete_age < $age_category['usia_min'] || $athlete_age > $age_category['usia_max']) {
+                throw new Exception('Umur atlet tidak sesuai dengan kategori yang dipilih.');
+            }
+        }
+        
+        // Validate competition category if selected (only for tanding)
+        if ($is_tanding && $category_id) {
+            $stmt = $pdo->prepare("SELECT * FROM competition_categories WHERE id = ? AND competition_id = ?");
+            $stmt->execute([$category_id, $competition_id]);
+            $category = $stmt->fetch();
+            
+            if (!$category) {
+                throw new Exception('Kategori tanding tidak valid.');
+            }
+            
+            // Check weight if category has weight limits
+            if (($category['berat_min'] && $athlete['berat_badan'] < $category['berat_min']) ||
+                ($category['berat_max'] && $athlete['berat_badan'] > $category['berat_max'])) {
+                throw new Exception('Berat badan atlet tidak sesuai dengan kategori yang dipilih.');
+            }
+        }
+        
+        // For non-tanding competitions, set category IDs to null
+        if (!$is_tanding) {
+            $age_category_id = null;
+            $category_id = null;
+        }
+        
+        // Update registration
+        $stmt = $pdo->prepare("
+            UPDATE registrations SET 
+                athlete_id = ?, 
+                category_id = ?, 
+                competition_type_id = ?,
+                updated_at = NOW()
+            WHERE id = ?
+        ");
+        $stmt->execute([
+            $athlete_id, 
+            $category_id, 
+            $competition_type_id,
+            $registration_id
+        ]);
+        
+        sendNotification('Pendaftaran berhasil diperbarui!', 'success');
+        header('Location: perlombaan.php?tab=registered-athletes&updated=1');
+        exit();
+        
+    } catch (Exception $e) {
+        sendNotification('Gagal memperbarui pendaftaran: ' . $e->getMessage(), 'error');
+    }
+}
+
+// Get notification
+$notification = getNotification();
+?>
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edit Pendaftaran - <?php echo htmlspecialchars($registration['nama_perlombaan']); ?></title>
+    <link rel="stylesheet" href="../../assets/css/style.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .registration-container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: var(--shadow-lg);
+            overflow: hidden;
+        }
+
+        .registration-header {
+            background: #f8fafc;
+            color: #2563eb;
+            padding: 30px;
+            text-align: center;
+            border-bottom: 2px solid #2563eb22;
+        }
+
+        .registration-header h1 {
+            margin: 0 0 10px 0;
+            font-size: 2.1rem;
+            color: #2563eb;
+            font-weight: 800;
+            letter-spacing: 1px;
+        }
+
+        .registration-header p {
+            margin: 0;
+            color: #2563eb;
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+
+        .registration-form {
+            padding: 40px;
+        }
+
+        .current-data {
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+
+        .current-data h3 {
+            color: var(--primary-color);
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .current-data-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .current-data-item {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .current-data-item label {
+            font-weight: 600;
+            color: var(--text-color);
+            font-size: 0.9rem;
+        }
+
+        .current-data-item span {
+            color: var(--text-light);
+            padding: 8px 12px;
+            background: white;
+            border-radius: 4px;
+            border: 1px solid #dee2e6;
+        }
+
+        .form-section {
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border-color);
+            transition: all 0.3s ease;
+        }
+
+        .form-section:last-child {
+            border-bottom: none;
+        }
+
+        .form-section.hidden {
+            display: none;
+        }
+
+        .form-section h3 {
+            color: var(--primary-color);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+        }
+
+        .form-group.hidden {
+            display: none;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--text-color);
+        }
+
+        .form-group label.required::after {
+            content: ' *';
+            color: var(--danger-color);
+        }
+
+        .form-group select,
+        .form-group input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+
+        .form-group select:focus,
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .form-help {
+            font-size: 0.9rem;
+            color: var(--text-light);
+            margin-top: 5px;
+        }
+
+        .athlete-info {
+            background: var(--light-color);
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .athlete-info h4 {
+            margin: 0 0 15px 0;
+            color: var(--primary-color);
+        }
+
+        .athlete-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .athlete-detail {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .athlete-detail label {
+            font-weight: 600;
+            color: var(--text-color);
+            font-size: 0.9rem;
+        }
+
+        .athlete-detail span {
+            color: var(--text-light);
+        }
+
+        .price-info {
+            background: #f0fdf4;
+            border: 2px solid var(--success-color);
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .price-info h4 {
+            margin: 0 0 10px 0;
+            color: var(--success-color);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .price-amount {
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: var(--success-color);
+        }
+
+        .form-actions {
+            display: flex;
+            gap: 15px;
+            justify-content: flex-end;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .btn-submit {
+            background: linear-gradient(135deg, #2563eb, #1d4ed8);
+            color: #fff;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 4px 12px rgba(37,99,235,0.15);
+            transition: all 0.3s;
+        }
+
+        .btn-submit:hover {
+            background: linear-gradient(135deg, #1d4ed8, #2563eb);
+            box-shadow: 0 8px 24px rgba(37,99,235,0.25);
+            transform: translateY(-2px) scale(1.03);
+        }
+
+        .btn-submit:disabled {
+            background: var(--text-light);
+            cursor: not-allowed;
+        }
+
+        .btn-cancel {
+            background: #fff;
+            color: #2563eb;
+            border: 2px solid #2563eb;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            transition: all 0.3s;
+            text-decoration: none;
+        }
+
+        .btn-cancel:hover {
+            background: #2563eb;
+            color: #fff;
+            border-color: #2563eb;
+            transform: translateY(-2px) scale(1.03);
+        }
+
+        .loading-spinner {
+            display: none;
+            width: 20px;
+            height: 20px;
+            border: 2px solid transparent;
+            border-top: 2px solid currentColor;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .competition-type-info {
+            background: #e0f2fe;
+            border: 2px solid #0288d1;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .competition-type-info.tanding {
+            background: #fff3e0;
+            border-color: #ff9800;
+        }
+
+        .competition-type-info h4 {
+            margin: 0 0 10px 0;
+            color: #0288d1;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .competition-type-info.tanding h4 {
+            color: #ff9800;
+        }
+
+        .edit-warning {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            color: #856404;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        @media (max-width: 768px) {
+            .registration-form {
+                padding: 20px;
+            }
+            
+            .current-data-grid,
+            .athlete-details {
+                grid-template-columns: 1fr;
+            }
+            
+            .form-actions {
+                flex-direction: column;
+            }
+        }
+
+        .edit-instructions {
+            background: #e3f2fd;
+            border: 2px solid #2196f3;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+
+        .edit-instructions h3 {
+            color: #1976d2;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .edit-options {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+
+        .edit-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            border: 1px solid #e3f2fd;
+        }
+
+        .edit-option i {
+            color: #2196f3;
+            font-size: 1.2rem;
+            margin-top: 2px;
+        }
+
+        .edit-option strong {
+            color: #1976d2;
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        .edit-option p {
+            margin: 0;
+            color: #666;
+            font-size: 0.9rem;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-logo">
+                <i class="fas fa-fist-raised"></i>
+                <span>User Panel</span>
+            </div>
+        </div>
+        <ul class="sidebar-menu">
+            <li><a href="index.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+            <li><a href="data-atlet.php"><i class="fas fa-user-ninja"></i> Data Atlet</a></li>
+            <li><a href="perlombaan.php" class="active"><i class="fas fa-trophy"></i> Perlombaan</a></li>
+            <li><a href="akun-saya.php"><i class="fas fa-user-circle"></i> Akun Saya</a></li>
+            <li><a href="../../auth/logout.php"><i class="fas fa-sign-out-alt"></i> Logout</a></li>
+        </ul>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="page-header">
+            <h1 class="page-title">Edit Pendaftaran</h1>
+            <p class="page-subtitle">Ubah data pendaftaran atlet Anda</p>
+        </div>
+
+        <?php if ($notification): ?>
+            <div class="alert alert-<?php echo $notification['type'] === 'success' ? 'success' : 'danger'; ?>">
+                <i class="fas fa-<?php echo $notification['type'] === 'success' ? 'check-circle' : 'exclamation-circle'; ?>"></i> 
+                <?php echo $notification['message']; ?>
+            </div>
+        <?php endif; ?>
+
+        <div class="registration-container">
+            <div class="registration-header">
+                <h1><?php echo htmlspecialchars($registration['nama_perlombaan']); ?></h1>
+                <p>Tanggal Pelaksanaan: <?php echo formatDate($registration['tanggal_pelaksanaan']); ?></p>
+            </div>
+
+            <div class="registration-form">
+                <div class="edit-warning">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <div>
+                        <strong>Perhatian!</strong> Anda sedang mengedit pendaftaran yang sudah ada. 
+                        Pastikan data yang diubah sudah benar sebelum menyimpan.
+                    </div>
+                </div>
+
+                <!-- Current Registration Data -->
+                <div class="current-data">
+                    <h3><i class="fas fa-info-circle"></i> Data Pendaftaran Saat Ini</h3>
+                    <div class="current-data-grid">
+                        <div class="current-data-item">
+                            <label>Atlet:</label>
+                            <span><?php echo htmlspecialchars($registration['athlete_name']); ?></span>
+                        </div>
+                        <div class="current-data-item">
+                            <label>Kontingen:</label>
+                            <span><?php echo htmlspecialchars($registration['nama_kontingen']); ?></span>
+                        </div>
+                        <div class="current-data-item">
+                            <label>Jenis Kompetisi:</label>
+                            <span><?php echo isset($registration['nama_kompetisi']) ? htmlspecialchars($registration['nama_kompetisi']) : '-'; ?></span>
+                        </div>
+                        <div class="current-data-item">
+                            <label>Kategori Umur:</label>
+                            <span><?php echo isset($registration['age_category_name']) ? htmlspecialchars($registration['age_category_name']) : '-'; ?></span>
+                        </div>
+                        <div class="current-data-item">
+                            <label>Kategori Tanding:</label>
+                            <span><?php echo $registration['competition_category_name'] ? htmlspecialchars($registration['competition_category_name']) : '-'; ?></span>
+                        </div>
+                        <div class="current-data-item">
+                            <label>Biaya Pendaftaran:</label>
+                            <span><?php echo isset($registration['biaya_pendaftaran']) && $registration['biaya_pendaftaran'] ? formatRupiah($registration['biaya_pendaftaran']) : 'Gratis'; ?></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Edit Instructions -->
+                <div class="edit-instructions">
+                    <h3><i class="fas fa-info-circle"></i> Yang Dapat Diubah</h3>
+                    <div class="edit-options">
+                        <div class="edit-option">
+                            <i class="fas fa-user-ninja"></i>
+                            <div>
+                                <strong>Ganti Atlet</strong>
+                                <p>Pilih atlet lain dari kontingen Anda</p>
+                            </div>
+                        </div>
+                        <div class="edit-option">
+                            <i class="fas fa-star"></i>
+                            <div>
+                                <strong>Ganti Jenis Kompetisi</strong>
+                                <p>Ubah dari tanding ke non-tanding atau sebaliknya</p>
+                            </div>
+                        </div>
+                        <div class="edit-option">
+                            <i class="fas fa-users"></i>
+                            <div>
+                                <strong>Ganti Kategori Umur</strong>
+                                <p>Sesuaikan dengan umur atlet yang dipilih</p>
+                            </div>
+                        </div>
+                        <div class="edit-option">
+                            <i class="fas fa-list"></i>
+                            <div>
+                                <strong>Ganti Kategori Tanding</strong>
+                                <p>Pilih kategori tanding yang sesuai (untuk kompetisi tanding)</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <form method="POST" id="registrationForm">
+                    <input type="hidden" name="action" value="update">
+                    
+                    <!-- Athlete Selection -->
+                    <div class="form-section">
+                        <h3><i class="fas fa-user-ninja"></i> Pilih Atlet</h3>
+                        <div class="form-group">
+                            <label for="athlete_id" class="required">Atlet</label>
+                            <select id="athlete_id" name="athlete_id" required onchange="showAthleteInfo()">
+                                <option value="">Pilih Atlet</option>
+                                <?php foreach ($athletes as $athlete): ?>
+                                    <option value="<?php echo $athlete['id']; ?>" 
+                                            <?php echo ($athlete['id'] == $registration['athlete_id']) ? 'selected' : ''; ?>
+                                            data-name="<?php echo htmlspecialchars($athlete['nama']); ?>"
+                                            data-nik="<?php echo htmlspecialchars($athlete['nik']); ?>"
+                                            data-gender="<?php echo $athlete['jenis_kelamin'] === 'L' ? 'Laki-laki' : 'Perempuan'; ?>"
+                                            data-birth="<?php echo formatDate($athlete['tanggal_lahir']); ?>"
+                                            data-age="<?php echo date_diff(date_create($athlete['tanggal_lahir']), date_create('today'))->y; ?>"
+                                            data-weight="<?php echo $athlete['berat_badan']; ?>"
+                                            data-height="<?php echo $athlete['tinggi_badan']; ?>"
+                                            data-kontingen="<?php echo htmlspecialchars($athlete['nama_kontingen']); ?>">
+                                        <?php echo htmlspecialchars($athlete['nama']); ?> - <?php echo htmlspecialchars($athlete['nama_kontingen']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="form-help">Pilih atlet yang akan didaftarkan</div>
+                        </div>
+                        
+                        <div id="athleteInfo" class="athlete-info" style="display: none;">
+                            <h4>Informasi Atlet</h4>
+                            <div class="athlete-details">
+                                <div class="athlete-detail">
+                                    <label>Nama:</label>
+                                    <span id="athleteName">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>NIK:</label>
+                                    <span id="athleteNik">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>Jenis Kelamin:</label>
+                                    <span id="athleteGender">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>Tanggal Lahir:</label>
+                                    <span id="athleteBirth">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>Umur:</label>
+                                    <span id="athleteAge">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>Berat Badan:</label>
+                                    <span id="athleteWeight">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>Tinggi Badan:</label>
+                                    <span id="athleteHeight">-</span>
+                                </div>
+                                <div class="athlete-detail">
+                                    <label>Kontingen:</label>
+                                    <span id="athleteKontingen">-</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Competition Type Selection -->
+                    <div class="form-section">
+                        <h3><i class="fas fa-star"></i> Jenis Kompetisi</h3>
+                        <div class="form-group">
+                            <label for="competition_type_id" class="required">Jenis Kompetisi</label>
+                            <select id="competition_type_id" name="competition_type_id" required onchange="handleCompetitionTypeChange()">
+                                <option value="">Pilih Jenis Kompetisi</option>
+                                <?php foreach ($competition_types as $comp_type): ?>
+                                    <option value="<?php echo $comp_type['id']; ?>" 
+                                            <?php echo ($comp_type['id'] == $registration['competition_type_id']) ? 'selected' : ''; ?>
+                                            data-price="<?php echo $comp_type['biaya_pendaftaran']; ?>"
+                                            data-description="<?php echo htmlspecialchars($comp_type['deskripsi']); ?>"
+                                            data-is-tanding="<?php echo $comp_type['is_tanding']; ?>">
+                                        <?php echo htmlspecialchars($comp_type['nama_kompetisi']); ?>
+                                        <?php if ($comp_type['biaya_pendaftaran']): ?>
+                                            - <?php echo formatRupiah($comp_type['biaya_pendaftaran']); ?>
+                                        <?php else: ?>
+                                            - Gratis
+                                        <?php endif; ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="form-help">Pilih jenis kompetisi yang akan diikuti</div>
+                        </div>
+                        
+                        <div id="competitionTypeInfo" class="competition-type-info" style="display: none;">
+                            <h4><i class="fas fa-info-circle"></i> <span id="competitionTypeTitle">Informasi Kompetisi</span></h4>
+                            <div id="competitionTypeDescription"></div>
+                        </div>
+                        
+                        <div id="priceInfo" class="price-info" style="display: none;">
+                            <h4><i class="fas fa-money-bill-wave"></i> Biaya Pendaftaran</h4>
+                            <div class="price-amount" id="priceAmount">Rp 0</div>
+                            <div id="priceDescription"></div>
+                        </div>
+                    </div>
+
+                    <!-- Category Selection (Only for Tanding) -->
+                    <div class="form-section" id="categorySection">
+                        <h3><i class="fas fa-list"></i> Kategori Perlombaan</h3>
+                        
+                        <?php if (!empty($age_categories)): ?>
+                        <div class="form-group" id="ageCategoryGroup">
+                            <label for="age_category_id" class="required">Kategori Umur</label>
+                            <select id="age_category_id" name="age_category_id" onchange="loadCompetitionCategories()">
+                                <option value="">Pilih Kategori Umur</option>
+                                <?php foreach ($age_categories as $age_cat): ?>
+                                    <option value="<?php echo $age_cat['id']; ?>" 
+                                            <?php echo ($age_cat['id'] == $registration['age_category_id']) ? 'selected' : ''; ?>
+                                            data-min="<?php echo $age_cat['usia_min']; ?>"
+                                            data-max="<?php echo $age_cat['usia_max']; ?>">
+                                        <?php echo htmlspecialchars($age_cat['nama_kategori']); ?> (<?php echo $age_cat['usia_min']; ?>-<?php echo $age_cat['usia_max']; ?> tahun)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="form-help">Pilih kategori umur sesuai dengan umur atlet</div>
+                        </div>
+                        <?php endif; ?>
+                        
+                        <div class="form-group" id="categoryGroup">
+                            <label for="category_id">Kategori Tanding</label>
+                            <select id="category_id" name="category_id">
+                                <option value="">Pilih Kategori Tanding</option>
+                            </select>
+                            <div class="form-help">Pilih kategori tanding jika tersedia (opsional)</div>
+                        </div>
+                    </div>
+
+                    <!-- Form Actions -->
+                    <div class="form-actions">
+                        <a href="perlombaan.php" class="btn-cancel">
+                            <i class="fas fa-arrow-left"></i> Kembali
+                        </a>
+                        <button type="submit" class="btn-submit" id="submitBtn">
+                            <span class="loading-spinner" id="loadingSpinner"></span>
+                            <i class="fas fa-save" id="submitIcon"></i> 
+                            <span id="submitText">Simpan Perubahan</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const COMPETITION_ID = <?php echo $competition_id; ?>;
+        const CURRENT_CATEGORY_ID = <?php echo $registration['category_id'] ?: 'null'; ?>;
+        
+        function showAthleteInfo() {
+            const select = document.getElementById('athlete_id');
+            const option = select.options[select.selectedIndex];
+            const info = document.getElementById('athleteInfo');
+            
+            if (option.value) {
+                document.getElementById('athleteName').textContent = option.dataset.name;
+                document.getElementById('athleteNik').textContent = option.dataset.nik;
+                document.getElementById('athleteGender').textContent = option.dataset.gender;
+                document.getElementById('athleteBirth').textContent = option.dataset.birth;
+                document.getElementById('athleteAge').textContent = option.dataset.age + ' tahun';
+                document.getElementById('athleteWeight').textContent = option.dataset.weight + ' kg';
+                document.getElementById('athleteHeight').textContent = option.dataset.height + ' cm';
+                document.getElementById('athleteKontingen').textContent = option.dataset.kontingen;
+                
+                info.style.display = 'block';
+                
+                // Validate age categories
+                validateAgeCategories(parseInt(option.dataset.age));
+            } else {
+                info.style.display = 'none';
+            }
+        }
+        
+        function validateAgeCategories(athleteAge) {
+            const ageCategorySelect = document.getElementById('age_category_id');
+            const options = ageCategorySelect.options;
+            
+            for (let i = 1; i < options.length; i++) {
+                const option = options[i];
+                const minAge = parseInt(option.dataset.min);
+                const maxAge = parseInt(option.dataset.max);
+                
+                if (athleteAge >= minAge && athleteAge <= maxAge) {
+                    option.disabled = false;
+                    option.style.color = '';
+                } else {
+                    option.disabled = true;
+                    option.style.color = '#ccc';
+                }
+            }
+        }
+        
+        function handleCompetitionTypeChange() {
+            const select = document.getElementById('competition_type_id');
+            const option = select.options[select.selectedIndex];
+            const categorySection = document.getElementById('categorySection');
+            const ageCategoryGroup = document.getElementById('ageCategoryGroup');
+            const categoryGroup = document.getElementById('categoryGroup');
+            const competitionTypeInfo = document.getElementById('competitionTypeInfo');
+            const competitionTypeTitle = document.getElementById('competitionTypeTitle');
+            const competitionTypeDescription = document.getElementById('competitionTypeDescription');
+            const priceInfo = document.getElementById('priceInfo');
+            const priceAmount = document.getElementById('priceAmount');
+            const priceDescription = document.getElementById('priceDescription');
+            
+            if (option.value) {
+                const price = parseFloat(option.dataset.price) || 0;
+                const description = option.dataset.description;
+                const isTanding = option.dataset.isTanding === '1';
+                const competitionName = option.textContent.split(' - ')[0];
+                
+                // Show competition type info
+                competitionTypeTitle.textContent = `Informasi ${competitionName}`;
+                competitionTypeDescription.textContent = description || 'Tidak ada deskripsi tambahan.';
+                competitionTypeInfo.style.display = 'block';
+                competitionTypeInfo.className = isTanding ? 'competition-type-info tanding' : 'competition-type-info';
+                
+                // Show price info
+                priceAmount.textContent = price > 0 ? 'Rp ' + new Intl.NumberFormat('id-ID').format(price) : 'Gratis';
+                priceDescription.textContent = description || '';
+                priceInfo.style.display = 'block';
+                
+                // Show/hide category sections based on competition type
+                if (isTanding) {
+                    // Show category sections for tanding competitions
+                    categorySection.classList.remove('hidden');
+                    ageCategoryGroup.classList.remove('hidden');
+                    categoryGroup.classList.remove('hidden');
+                    
+                    // Make age category required for tanding
+                    document.getElementById('age_category_id').required = true;
+                    
+                    // Update labels to show required
+                    const ageCategoryLabel = ageCategoryGroup.querySelector('label');
+                    if (!ageCategoryLabel.classList.contains('required')) {
+                        ageCategoryLabel.classList.add('required');
+                    }
+                    
+                    // Load categories if age category is already selected
+                    if (document.getElementById('age_category_id').value) {
+                        loadCompetitionCategories();
+                    }
+                } else {
+                    // Hide category sections for non-tanding competitions
+                    categorySection.classList.add('hidden');
+                    ageCategoryGroup.classList.add('hidden');
+                    categoryGroup.classList.add('hidden');
+                    
+                    // Remove required attribute and reset values
+                    document.getElementById('age_category_id').required = false;
+                    document.getElementById('age_category_id').value = '';
+                    document.getElementById('category_id').value = '';
+                    
+                    // Remove required class from label
+                    const ageCategoryLabel = ageCategoryGroup.querySelector('label');
+                    ageCategoryLabel.classList.remove('required');
+                }
+            } else {
+                // Hide all info sections when no competition type is selected
+                competitionTypeInfo.style.display = 'none';
+                priceInfo.style.display = 'none';
+                
+                // Show category sections by default
+                categorySection.classList.remove('hidden');
+                ageCategoryGroup.classList.remove('hidden');
+                categoryGroup.classList.remove('hidden');
+                
+                // Reset required state
+                document.getElementById('age_category_id').required = false;
+                const ageCategoryLabel = ageCategoryGroup.querySelector('label');
+                ageCategoryLabel.classList.remove('required');
+            }
+        }
+        
+        function loadCompetitionCategories() {
+            const ageCategoryId = document.getElementById('age_category_id').value;
+            const categorySelect = document.getElementById('category_id');
+            
+            // Reset category select
+            categorySelect.innerHTML = '<option value="">Pilih Kategori Tanding</option>';
+            
+            if (ageCategoryId) {
+                const url = `get-competition-categories.php?competition_id=${COMPETITION_ID}&age_category_id=${ageCategoryId}`;
+                
+                fetch(url)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success && data.data) {
+                            if (data.data.length === 0) {
+                                categorySelect.innerHTML = '<option value="">Tidak ada kategori tanding untuk kategori umur ini</option>';
+                            } else {
+                                data.data.forEach(category => {
+                                    const option = document.createElement('option');
+                                    option.value = category.id;
+                                    option.textContent = category.nama_kategori;
+                                    
+                                    // Select current category if it matches
+                                    if (CURRENT_CATEGORY_ID && category.id == CURRENT_CATEGORY_ID) {
+                                        option.selected = true;
+                                    }
+                                    
+                                    // Add weight info if available
+                                    if (category.berat_min || category.berat_max) {
+                                        const weightInfo = [];
+                                        if (category.berat_min) weightInfo.push(`Min: ${category.berat_min}kg`);
+                                        if (category.berat_max) weightInfo.push(`Max: ${category.berat_max}kg`);
+                                        option.textContent += ` (${weightInfo.join(', ')})`;
+                                    }
+                                    
+                                    categorySelect.appendChild(option);
+                                });
+                            }
+                        } else {
+                            categorySelect.innerHTML = '<option value="">Error loading categories</option>';
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error loading categories:', error);
+                        categorySelect.innerHTML = '<option value="">Error loading categories</option>';
+                    });
+            }
+        }
+        
+        // Form submission
+        document.getElementById('registrationForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            // Show confirmation dialog
+            const currentAthlete = '<?php echo htmlspecialchars($registration['athlete_name']); ?>';
+            const currentCompetition = '<?php echo htmlspecialchars($registration['nama_kompetisi']); ?>';
+            const newAthlete = document.getElementById('athlete_id').options[document.getElementById('athlete_id').selectedIndex].text;
+            const newCompetition = document.getElementById('competition_type_id').options[document.getElementById('competition_type_id').selectedIndex].text;
+            
+            let changes = [];
+            if (currentAthlete !== newAthlete.split(' - ')[0]) {
+                changes.push(`• Atlet: ${currentAthlete} → ${newAthlete.split(' - ')[0]}`);
+            }
+            if (currentCompetition !== newCompetition.split(' - ')[0]) {
+                changes.push(`• Jenis Kompetisi: ${currentCompetition} → ${newCompetition.split(' - ')[0]}`);
+            }
+            
+            if (changes.length > 0) {
+                const confirmMessage = `Anda akan mengubah:\n${changes.join('\n')}\n\nApakah Anda yakin?`;
+                if (!confirm(confirmMessage)) {
+                    return;
+                }
+            }
+            
+            const submitBtn = document.getElementById('submitBtn');
+            const submitIcon = document.getElementById('submitIcon');
+            const submitText = document.getElementById('submitText');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+            
+            // Show loading state
+            submitBtn.disabled = true;
+            submitIcon.style.display = 'none';
+            loadingSpinner.style.display = 'inline-block';
+            submitText.textContent = 'Menyimpan Perubahan...';
+            
+            // Submit the form
+            this.submit();
+        });
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            // Show athlete info for selected athlete
+            if (document.getElementById('athlete_id').value) {
+                showAthleteInfo();
+            }
+            
+            // Handle competition type change
+            handleCompetitionTypeChange();
+            
+            // Load categories if age category is selected
+            if (document.getElementById('age_category_id').value) {
+                loadCompetitionCategories();
+            }
+        });
+    </script>
+</body>
+</html>

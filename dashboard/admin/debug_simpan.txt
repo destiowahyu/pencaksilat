@@ -1,0 +1,28 @@
+Array
+(
+    [peserta_ids] => Array
+        (
+            [0] => 2760
+            [1] => 2786
+            [2] => 2849
+            [3] => 2891
+            [4] => 2931
+            [5] => 2959
+            [6] => 3016
+            [7] => 3116
+            [8] => 3197
+            [9] => 3226
+            [10] => 3250
+            [11] => 3263
+            [12] => 3295
+            [13] => 3299
+            [14] => 3426
+            [15] => 3478
+            [16] => 3564
+        )
+
+    [kategori_umur] => USIA DINI 1
+    [jenis_kelamin] => L
+    [jenis_kompetisi] => TANDING
+    [kategori_tanding] => TANDING KELAS C
+)

@@ -1,0 +1,14 @@
+<table border='1'><tr>
+    <th>No</th>
+    <th>Nama Atlet</th>
+    <th>Jenis Kelamin</th>
+    <th>Nama Kontingen</th>
+    <th>Penanggung Jawab</th>
+    <th>Kontak PJ</th>
+    <th>Kategori</th>
+    <th>Kategori Umur</th>
+    <th>Jenis Kompetisi</th>
+    <th>Biaya Pendaftaran</th>
+    <th>Status Pembayaran</th>
+    <th>Tanggal Daftar</th>
+</tr><tr><td>1</td><td>AHMAD</td><td>Laki-laki</td><td>Tapak Suci Semarang</td><td>naufal123</td><td>081123456789</td><td>TANDING KELAS B</td><td>USIA DINI 1</td><td>TANDING </td><td>300000.00</td><td>paid</td><td>03-07-2025</td></tr></table>

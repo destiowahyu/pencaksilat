@@ -1,0 +1,5 @@
+<?php
+// Redirect to the new template (now generates .xlsx)
+header('Location: template-atlet.php');
+exit();
+?> 
